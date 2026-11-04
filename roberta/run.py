@@ -3,27 +3,40 @@
 import dataclasses
 import logging
 import os
+import random
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Union, List
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Union
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import random
-import numpy as np
-
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, EvalPrediction, PreTrainedTokenizerBase
-from src.modeling_roberta import RobertaConfig
-from transformers import GlueDataTrainingArguments as DataTrainingArguments
-from transformers import HfArgumentParser, TrainingArguments, set_seed
-
-from src.linearhead_trainer import LinearHeadTrainer
-from src.dataset import FewShotDataset, OurInputFeatures
-from src.models import MODEL_TYPES, resize_token_type_embeddings
-from src.trainer import Trainer
-from src.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
-
 from filelock import FileLock
-from datetime import datetime
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    EvalPrediction,
+    GlueDataTrainingArguments as DataTrainingArguments,
+    HfArgumentParser,
+    PreTrainedTokenizerBase,
+    TrainingArguments,
+    set_seed,
+)
+
+from src.dataset import FewShotDataset, OurInputFeatures
+from src.linearhead_trainer import LinearHeadTrainer
+from src.modeling_roberta import RobertaConfig
+from src.models import MODEL_TYPES, resize_token_type_embeddings
+from src.processors import (
+    bound_mapping,
+    compute_metrics_mapping,
+    num_labels_mapping,
+    output_modes_mapping,
+    processors_mapping,
+)
+from src.trainer import Trainer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -185,7 +198,7 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
 
     demo_filter_rate: float = field(
         default=0.5,
-        metadata={"help": "Only use top-x\% similar instances in demonstrations"}
+        metadata={"help": "Only use top-x% similar instances in demonstrations"}
     )
 
     demo_filter_model: str = field(
@@ -429,7 +442,7 @@ class DynamicTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Clip the norm of the gradient for zero order (only when using trainer optimizer)"}
     )
-     
+
     # MeZO
     zo_variant: str = field(
         default=None,
@@ -459,8 +472,7 @@ class DynamicTrainingArguments(TrainingArguments):
     # DPZERO args
     dpzero: bool = field(
         default=False,
-        metadata={
-            "help": 'whether to use DPZero in training'}
+        metadata={"help": 'whether to use DPZero in training'}
     )
     dpzero_clip_threshold: float = field(
         default=1.0,
@@ -475,9 +487,18 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "DP delta"}
     )
 
+    # Folder 1 & Folder 2 Experiment Arguments
     mismatch: float = field(
         default=0.0,
-        metadata={"help": "training mismatch pct"}
+        metadata={"help": "training mismatch pct (Folder 1 experiment)"}
+    )
+    flip_val: int = field(
+        default=-1,
+        metadata={"help": "Epoch to remove/flip clipping and LR (Folder 2 flipped_r experiment; -1 disables)"}
+    )
+    mixed_flip: bool = field(
+        default=False,
+        metadata={"help": "Toggle clipping every 20 epochs (Folder 2 mixed experiment)"}
     )
 
 
@@ -485,25 +506,6 @@ class DynamicTrainingArguments(TrainingArguments):
 class MyDataCollatorWithPadding:
     """
     Implements padding for LM-BFF inputs.
-    Args:
-        tokenizer ([`PreTrainedTokenizer`] or [`PreTrainedTokenizerFast`]):
-            The tokenizer used for encoding the data.
-        padding (`bool`, `str` or [`~utils.PaddingStrategy`], *optional*, defaults to `True`):
-            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
-            among:
-            - `True` or `'longest'` (default): Pad to the longest sequence in the batch (or no padding if only a single
-              sequence is provided).
-            - `'max_length'`: Pad to a maximum length specified with the argument `max_length` or to the maximum
-              acceptable input length for the model if that argument is not provided.
-            - `False` or `'do_not_pad'`: No padding (i.e., can output a batch with sequences of different lengths).
-        max_length (`int`, *optional*):
-            Maximum length of the returned list and optionally padding length (see above).
-        pad_to_multiple_of (`int`, *optional*):
-            If set will pad the sequence to a multiple of the provided value.
-            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
-            7.5 (Volta).
-        return_tensors (`str`):
-            The type of Tensor to return. Allowable values are "np", "pt" and "tf".
     """
 
     tokenizer: PreTrainedTokenizerBase
@@ -515,18 +517,24 @@ class MyDataCollatorWithPadding:
     def __call__(self, features):
         mask_pos = []
         standard_features = []
-        example_ids = []  # <--- ADD THIS LINE
+        example_ids = []
 
         if features[0].sfc_input_ids is not None:
-            sfc_batch = self.__call__([OurInputFeatures(input_ids=x.sfc_input_ids, attention_mask=x.sfc_attention_mask, mask_pos=x.sfc_mask_pos) for x in features])
+            sfc_batch = self.__call__([
+                OurInputFeatures(
+                    input_ids=x.sfc_input_ids,
+                    attention_mask=x.sfc_attention_mask,
+                    mask_pos=x.sfc_mask_pos
+                ) for x in features
+            ])
 
         for item in features:
-            if hasattr(item, "example_id") and item.example_id is not None: # <--- ADD THIS BLOCK
-                example_ids.append(item.example_id)                         # <--- ADD THIS BLOCK
+            if hasattr(item, "example_id") and item.example_id is not None:
+                example_ids.append(item.example_id)
             standard_item = {}
-            for field in ["input_ids", "label", "attention_mask", "token_type_ids"]:
-                if getattr(item, field) is not None:
-                    standard_item[field] = getattr(item, field)
+            for field_name in ["input_ids", "label", "attention_mask", "token_type_ids"]:
+                if getattr(item, field_name) is not None:
+                    standard_item[field_name] = getattr(item, field_name)
             standard_features.append(standard_item)
             mask_pos.append(item.mask_pos)
 
@@ -547,14 +555,14 @@ class MyDataCollatorWithPadding:
         if "label_ids" in batch:
             batch["labels"] = batch["label_ids"]
             del batch["label_ids"]
-        
+
         if features[0].sfc_input_ids is not None:
             batch["sfc_input_ids"] = sfc_batch["input_ids"]
             batch["sfc_attention_mask"] = sfc_batch["attention_mask"]
             batch["sfc_mask_pos"] = sfc_batch["mask_pos"]
-        
-        if example_ids: # <--- ADD THIS BLOCK
-            batch["example_id"] = torch.tensor(example_ids) # <--- ADD THIS BLOCK
+
+        if example_ids:
+            batch["example_id"] = torch.tensor(example_ids)
 
         return batch
 
@@ -562,11 +570,12 @@ class MyDataCollatorWithPadding:
 def main():
     parser = HfArgumentParser((ModelArguments, DynamicDataTrainingArguments, DynamicTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # Force Constant Scheduler so linear decay does not overwrite manual LR flips
+    training_args.lr_scheduler_type = "constant"
 
     if training_args.sweep:
         now = datetime.now()
@@ -574,7 +583,7 @@ def main():
         training_args.output_dir = os.path.join(training_args.output_dir, dt_str)
 
     if model_args.apply_lora:
-       assert 'roberta' in model_args.model_name_or_path, 'LoRA only implemented for RoBERTa models'
+        assert 'roberta' in model_args.model_name_or_path, 'LoRA only implemented for RoBERTa models'
 
     if training_args.kernel_formula == 'asymmetric_signgd':
         assert training_args.binary_classification, 'asymmetric solver not implemented for multi-class setting, use --binary_classification'
@@ -619,19 +628,17 @@ def main():
                         if len(line) > 0:
                             data_args.template_list.append(line)
 
-                # Load top-n templates
                 if data_args.top_n_template is not None:
                     data_args.template_list = data_args.template_list[:data_args.top_n_template]
                 logger.info("Load top-%d templates from %s" % (len(data_args.template_list), data_args.template_path))
 
-                # ... or load i-th template
                 if data_args.template_id is not None:
                     data_args.template = data_args.template_list[data_args.template_id]
                     data_args.template_list = None
                     logger.info("Specify load the %d-th template: %s" % (data_args.template_id, data_args.template))
 
             if data_args.mapping_path is not None:
-                assert data_args.mapping_id is not None # Only can use one label word mapping
+                assert data_args.mapping_id is not None
                 with open(data_args.mapping_path) as f:
                     mapping_list = []
                     for line in f:
@@ -671,18 +678,21 @@ def main():
         raise ValueError("Task not found: %s" % (data_args.task_name))
 
     # Create config
-    config_kwargs = {'dpzero': training_args.dpzero,
-                     'num_k': data_args.num_k,
-                     'apply_lora': model_args.apply_lora,
-                     'lora_alpha': model_args.lora_alpha,
-                     'lora_r': model_args.lora_r}
+    config_kwargs = {
+        'dpzero': training_args.dpzero,
+        'num_k': data_args.num_k,
+        'apply_lora': model_args.apply_lora,
+        'lora_alpha': model_args.lora_alpha,
+        'lora_r': model_args.lora_r,
+    }
 
     config = RobertaConfig.from_pretrained(
-            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-            num_labels=num_labels,
-            finetuning_task=data_args.task_name,
-            cache_dir=model_args.cache_dir,
-            **config_kwargs)
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=data_args.task_name,
+        cache_dir=model_args.cache_dir,
+        **config_kwargs
+    )
 
     if 'prompt' in model_args.few_shot_type:
         model_fn = MODEL_TYPES[config.model_type]
@@ -703,7 +713,7 @@ def main():
     )
 
     if training_args.hf_inference_model:
-        free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
+        free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024**3)
         max_memory = f'{free_in_GB-5}GB'
         n_gpus = torch.cuda.device_count()
         max_memory = {i: max_memory for i in range(n_gpus)}
@@ -726,16 +736,16 @@ def main():
     if training_args.tie_emb:
         logger.warn("Tie embeddings. Only work for RoBERTa (in our code by default they are not tied)")
         model.tie_emb()
-    
+
     if training_args.head_tuning:
         if model.config.model_type == "roberta":
             head_name = "lm_head"
 
         for n, p in model.named_parameters():
             if head_name not in n:
-                p.requires_grad = False 
+                p.requires_grad = False
             else:
-                logger.info(f"Only tuning {n}")        
+                logger.info(f"Only tuning {n}")
 
     tokenizer.model_type = model.config.model_type
 
@@ -746,111 +756,79 @@ def main():
         else None
     )
 
-    # # =================================================================
-    # # --- POISON 10% OF TRAINING DATA FOR DPZERO ROBUSTNESS TEST ---
-    # # =================================================================
-    # if train_dataset is not None:
-    #     logger.info("Injecting 10% label corruption into the TRAIN dataset...")
-    #     num_samples = len(train_dataset)
-    #     num_poison = int(0.10 * num_samples)
-        
-    #     all_indices = list(range(num_samples))
-    #     poison_indices = set(random.sample(all_indices, num_poison))
-        
-    #     # Setup dynamic file path based on config
-    #     lr_str = str(training_args.learning_rate)
-    #     seed_val = str(getattr(training_args, 'seed', 'unknown'))
-    #     clip_val = str(getattr(training_args, 'dpzero_clip_threshold', 0)) if getattr(training_args, 'dpzero', False) else "0"
-        
-    #     os.makedirs("final5", exist_ok=True)
-    #     poison_path = os.path.join("final5", f"train_mislabled_eval_lr{lr_str}_clip{clip_val}_seed{seed_val}.npy")
-    #     np.save(poison_path, np.array(list(poison_indices)))
-        
-    #     # Flip the labels in memory safely (Works for 2 or 3+ classes like SNLI)
-    #     count_poisoned = 0
-    #     for idx in poison_indices:
-    #         item = train_dataset[idx] 
-    #         if hasattr(item, "label") and item.label is not None:
-    #             new_label = (item.label + 1) % num_labels
-    #             object.__setattr__(item, "label", new_label)
-    #             count_poisoned += 1
-    #         elif hasattr(item, "label_ids") and item.label_ids is not None:
-    #             new_label = (item.label_ids + 1) % num_labels
-    #             object.__setattr__(item, "label_ids", new_label)
-    #             count_poisoned += 1
-                
-    #     logger.info(f"*** Poisoned {count_poisoned} examples. Saved IDs to: {poison_path} ***")
-    # # =================================================================
-
     # =================================================================
-    # --- POISON 10% OF TRAINING DATA FOR DPZERO ROBUSTNESS TEST ---
+    # FOLDER 1: Poison Training Data for DPZero Robustness Test
     # =================================================================
-    if train_dataset is not None:
-        logger.info("Injecting 10% label corruption into the TRAIN dataset...")
+    if train_dataset is not None and (training_args.mismatch > 0.0 or "--mismatch" in sys.argv):
+        logger.info(f"Injecting {training_args.mismatch * 100:.1f}% label corruption into the TRAIN dataset...")
         num_samples = len(train_dataset)
         num_poison = int(training_args.mismatch * num_samples)
-        
+
         # Lock the seed so the corrupted subset is identical across runs
         seed_val = getattr(training_args, 'seed', 42)
         random.seed(seed_val)
-        
+
         all_indices = list(range(num_samples))
         poison_indices = set(random.sample(all_indices, num_poison))
-        
+
         lr_str = str(training_args.learning_rate)
         clip_val = str(getattr(training_args, 'dpzero_clip_threshold', 0)) if getattr(training_args, 'dpzero', False) else "0"
-        
+
         os.makedirs("mismatched", exist_ok=True)
         poison_path = os.path.join("mismatched", f"train_mislabled_eval_lr{lr_str}_clip{clip_val}_seed{seed_val}_mis{training_args.mismatch}.npy")
         np.save(poison_path, np.array(list(poison_indices)))
-        
+
         # 1. Find where the data actually lives (handles fresh build vs cached)
         if hasattr(train_dataset, "features") and train_dataset.features is not None:
             data_list = train_dataset.features
         elif hasattr(train_dataset, "support_examples") and train_dataset.support_examples is not None:
             data_list = train_dataset.support_examples
         else:
-            data_list = train_dataset 
-        
+            data_list = train_dataset
+
         # 2. Universal Label Flipper (Handles ints, numbers-as-strings, and SNLI strings)
         def get_flipped_label(lbl, total_classes):
             if isinstance(lbl, int):
                 return (lbl + 1) % total_classes
             elif isinstance(lbl, str):
-                if lbl.isdigit(): # Handles '0', '1'
+                if lbl.isdigit():  # Handles '0', '1'
                     return str((int(lbl) + 1) % total_classes)
-                else:             # Handles 'contradiction', etc.
+                else:              # Handles 'contradiction', etc.
                     snli_map = ["contradiction", "entailment", "neutral"]
                     if lbl in snli_map:
                         return snli_map[(snli_map.index(lbl) + 1) % total_classes]
-            return lbl # Fallback if unrecognized
-        
+            return lbl
+
         count_poisoned = 0
         for idx in poison_indices:
-            item = data_list[idx] 
+            item = data_list[idx]
             flipped = False
-            
+
             # 3. Flip 'label' attribute safely using the function
             if hasattr(item, "label") and item.label is not None:
                 new_lbl = get_flipped_label(item.label, num_labels)
-                setattr(item, "label", new_lbl)
+                try:
+                    setattr(item, "label", new_lbl)
+                except dataclasses.FrozenInstanceError:
+                    object.__setattr__(item, "label", new_lbl)
                 flipped = True
-                
+
             # 4. Flip 'label_ids' attribute (if dataset uses tensors instead of raw labels)
             if hasattr(item, "label_ids") and item.label_ids is not None:
-                if isinstance(item.label_ids, int):
-                    setattr(item, "label_ids", (item.label_ids + 1) % num_labels)
-                elif hasattr(item.label_ids, "item"): # If it is a PyTorch tensor
-                    setattr(item, "label_ids", (item.label_ids + 1) % num_labels)
+                if isinstance(item.label_ids, int) or hasattr(item.label_ids, "item"):
+                    new_id = (item.label_ids + 1) % num_labels
+                    try:
+                        setattr(item, "label_ids", new_id)
+                    except dataclasses.FrozenInstanceError:
+                        object.__setattr__(item, "label_ids", new_id)
                 flipped = True
-                
+
             if flipped:
                 count_poisoned += 1
-                
+
         logger.info(f"*** Poisoned {count_poisoned} examples. Saved IDs to: {poison_path} ***")
     # =================================================================
 
-    
     eval_dataset = (
         FewShotDataset(data_args, tokenizer=tokenizer, mode="dev", use_demo=("demo" in model_args.few_shot_type))
         if training_args.do_eval
@@ -865,7 +843,7 @@ def main():
     set_seed(training_args.seed)
 
     if training_args.random_model_init:
-        model.init_weights() # reinit weights to random
+        model.init_weights()
 
     # For BERT, increase the size of the segment (token type) embeddings
     if config.model_type == 'bert':
@@ -873,10 +851,12 @@ def main():
         resize_token_type_embeddings(model, new_num_types=10, random_segment=model_args.random_segment)
 
     # Pass dataset and argument information to the model
-    if eval_dataset.label_word_list is not None:
+    if eval_dataset is not None and eval_dataset.label_word_list is not None:
         model.label_word_list = torch.tensor(eval_dataset.label_word_list).long().to(training_args.device)
+    elif train_dataset is not None and train_dataset.label_word_list is not None:
+        model.label_word_list = torch.tensor(train_dataset.label_word_list).long().to(training_args.device)
+
     if output_modes_mapping[data_args.task_name] == 'regression':
-        # lower / upper bounds
         model.lb, model.ub = bound_mapping[data_args.task_name]
     model.model_args = model_args
     model.data_args = data_args
@@ -884,14 +864,12 @@ def main():
 
     if model_args.apply_lora:
         for name, param in model.named_parameters():
-            if (name.startswith('roberta') and "lora" not in name):
+            if name.startswith('roberta') and "lora" not in name:
                 param.requires_grad_(False)
 
     # Build metric
     def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
         def compute_metrics_fn(p: EvalPrediction):
-            # Note: the eval dataloader is sequential, so the examples are in order.
-            # We average the logits over each sample for using demonstrations.
             predictions = p.predictions
             num_logits = predictions.shape[-1]
 
@@ -904,7 +882,6 @@ def main():
             else:
                 preds = np.argmax(logits, axis=1)
 
-            # Just for sanity, assert label ids are the same.
             label_ids = p.label_ids.reshape([num_sample, -1])
             label_ids_avg = label_ids.mean(axis=0)
             label_ids_avg = label_ids_avg.astype(p.label_ids.dtype)
@@ -944,13 +921,13 @@ def main():
         model.sfc_bias = F.log_softmax(logits.squeeze(0).detach())
         logger.info("SFC bias: {}".format(model.sfc_bias))
 
-
     # Training
     if training_args.do_train:
-        train_result = trainer.train(model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None)
+        train_result = trainer.train(
+            model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None
+        )
 
         if training_args.trainer == "hessian":
-            # Write the result to log
             with FileLock('log_hessian.lock'):
                 with open('log_hessian', 'a') as f:
                     train_result.update(vars(model_args))
@@ -961,7 +938,6 @@ def main():
                     f.write(str(train_result) + '\n')
             exit()
 
-        # Use the early stop, so do not save the model in the end (unless specify save_at_last)
         if training_args.trainer == "standard" or training_args.trainer == "linearhead":
             if training_args.save_at_last:
                 trainer.save_model(training_args.output_dir)
@@ -970,9 +946,8 @@ def main():
                 tokenizer.save_pretrained(training_args.output_dir)
                 torch.save(model_args, os.path.join(training_args.output_dir, "model_args.bin"))
                 torch.save(data_args, os.path.join(training_args.output_dir, "data_args.bin"))
-            
+
             if training_args.evaluate_during_training:
-                # Now we just reload this from memory instead of disk <-- much faster
                 trainer.model.load_state_dict(trainer.best_model_ckpt)
 
     # Evaluation
@@ -981,78 +956,96 @@ def main():
         'output_dir': training_args.output_dir
     }
 
-    # eval_results = {}
-    # if training_args.do_eval:
-    #     logger.info("*** Validate ***")
-
-    #     eval_datasets = [eval_dataset]
-
-    #     for eval_dataset in eval_datasets:
-    #         trainer.compute_metrics = build_compute_metrics_fn(eval_dataset.args.task_name)
-    #         output = trainer.evaluate(eval_dataset=eval_dataset,task='eval')
-    #         eval_result = output.metrics
-
-    #         output_eval_file = os.path.join(
-    #             training_args.output_dir, f"eval_results_{eval_dataset.args.task_name}.txt"
-    #         )
-    #         if trainer.is_world_process_zero():
-    #             with open(output_eval_file, "w") as writer:
-    #                 logger.info("***** Eval results {} *****".format(eval_dataset.args.task_name))
-    #                 for key, value in eval_result.items():
-    #                     logger.info("  %s = %s", key, value)
-    #                     writer.write("%s = %s\n" % (key, value))
-    #                     final_result[eval_dataset.args.task_name + '_dev_' + key] = value
-    #         eval_results.update(eval_result)
-
     eval_results = {}
-    if training_args.do_eval:
-        logger.info("*** Evaluate on TRAIN Set ***")
+    if training_args.do_eval and eval_dataset is not None:
+        logger.info("*** Validate ***")
+        eval_datasets = [eval_dataset]
 
-        # Passes the actual tokenized training data object pointers safely
-        eval_datasets = [train_dataset]
-
-        for eval_dataset in eval_datasets:
-            if eval_dataset is None:
-                continue
-                
-            trainer.compute_metrics = build_compute_metrics_fn(eval_dataset.args.task_name)
-            
-            # FIX: Removed the invalid task='train' keyword argument
-            output = trainer.evaluate(eval_dataset=eval_dataset,task='train')
+        for eval_ds in eval_datasets:
+            trainer.compute_metrics = build_compute_metrics_fn(eval_ds.args.task_name)
+            output = trainer.evaluate(eval_dataset=eval_ds, task='dev')
             eval_result = output.metrics
 
-            # Optional FIX: Renamed output text file so it doesn't overwrite your dev txt files
             output_eval_file = os.path.join(
-                training_args.output_dir, f"train_eval_results_{eval_dataset.args.task_name}.txt"
+                training_args.output_dir, f"eval_results_{eval_ds.args.task_name}.txt"
             )
             if trainer.is_world_process_zero():
                 with open(output_eval_file, "w") as writer:
-                    logger.info("***** Train results {} *****".format(eval_dataset.args.task_name))
+                    logger.info("***** Eval results {} *****".format(eval_ds.args.task_name))
                     for key, value in eval_result.items():
                         logger.info("  %s = %s", key, value)
                         writer.write("%s = %s\n" % (key, value))
-                        # FIX: Changed '_dev_' to '_train_eval_' to log it correctly in the master file
-                        final_result[eval_dataset.args.task_name + '_train_eval_' + key] = value
+                        final_result[eval_ds.args.task_name + '_dev_' + key] = value
             eval_results.update(eval_result)
+
+    # ==========================================
+    # Evaluate on Training Data
+    # ==========================================
+    train_eval_results = {}
+    if train_dataset is not None:
+        logger.info("*** Evaluate Train Data ***")
+        trainer.compute_metrics = build_compute_metrics_fn(train_dataset.args.task_name)
+        output = trainer.evaluate(eval_dataset=train_dataset, task='train')
+        train_eval_result = output.metrics
+
+        output_train_file = os.path.join(
+            training_args.output_dir, f"train_eval_results_{train_dataset.args.task_name}.txt"
+        )
+        if trainer.is_world_process_zero():
+            with open(output_train_file, "w") as writer:
+                logger.info("***** Train Eval results {} *****".format(train_dataset.args.task_name))
+                for key, value in train_eval_result.items():
+                    logger.info("  %s = %s", key, value)
+                    writer.write("%s = %s\n" % (key, value))
+                    final_result[train_dataset.args.task_name + '_train_eval_' + key] = value
+
+            if training_args.save_logit and training_args.save_logit_dir is not None:
+                predictions = output.predictions
+                num_logits = predictions.shape[-1]
+                logits = predictions.reshape([train_dataset.num_sample, -1, num_logits]).mean(axis=0)
+                np.save(
+                    os.path.join(
+                        training_args.save_logit_dir,
+                        "{}-train-{}-{}.npy".format(train_dataset.task_name, training_args.model_id, training_args.array_id)
+                    ),
+                    logits
+                )
+
+        train_eval_results.update(train_eval_result)
+    # ==========================================
 
     test_results = {}
     if training_args.do_predict:
         logging.info("*** Test ***")
+
         # ==========================================
-        # NEW: Save the exact model weights used for testing
+        # Save the exact model weights used for testing
         # ==========================================
         if trainer.is_world_process_zero():
             lr_str = str(training_args.learning_rate)
             seed_val = str(getattr(training_args, 'seed', 'unknown'))
             clip_val = str(getattr(training_args, 'dpzero_clip_threshold', 0)) if getattr(training_args, 'dpzero', False) else "0"
-            
-            # Construct the custom save directory
-            save_dir = os.path.join(os.getcwd(), f"mismatched/{test_dataset.args.task_name}_model_lr{lr_str}_clip{clip_val}_seed{seed_val}_mis{training_args.mismatch}")
+
+            if training_args.flip_val >= 0 or "--flip_val" in sys.argv:
+                flip_v = str(getattr(training_args, 'flip_val', 0))
+                save_dir = os.path.join(
+                    os.getcwd(),
+                    f"flipped_r/{data_args.task_name}_model_lr{lr_str}_clip{clip_val}_seed{seed_val}_flip{flip_v}"
+                )
+            elif training_args.mixed_flip:
+                save_dir = os.path.join(
+                    os.getcwd(),
+                    f"mixed/{data_args.task_name}_model_lr{lr_str}_clip{clip_val}_seed{seed_val}"
+                )
+            else:
+                save_dir = os.path.join(
+                    os.getcwd(),
+                    f"mismatched/{data_args.task_name}_model_lr{lr_str}_clip{clip_val}_seed{seed_val}_mis{training_args.mismatch}"
+                )
+
             os.makedirs(save_dir, exist_ok=True)
-            
             logger.info(f"Saving test-evaluated model weights to: {save_dir}")
-            
-            # Save the model weights, config, tokenizer, and args
+
             trainer.save_model(save_dir)
             tokenizer.save_pretrained(save_dir)
             torch.save(model_args, os.path.join(save_dir, "model_args.bin"))
@@ -1061,37 +1054,35 @@ def main():
         # ==========================================
 
         test_datasets = [test_dataset]
-        ### Don't evaluate on mnli-mm for our purposes
-        # if data_args.task_name == "mnli":
-        #     mnli_mm_data_args = dataclasses.replace(data_args, task_name="mnli-mm")
-        #     test_datasets.append(
-        #         FewShotDataset(mnli_mm_data_args, tokenizer=tokenizer, mode="test", use_demo=('demo' in model_args.few_shot_type))
-        #     )
-
-        for test_dataset in test_datasets:
-            trainer.compute_metrics = build_compute_metrics_fn(test_dataset.args.task_name)
-            output = trainer.evaluate(eval_dataset=test_dataset,task='test')
+        for test_ds in test_datasets:
+            trainer.compute_metrics = build_compute_metrics_fn(test_ds.args.task_name)
+            output = trainer.evaluate(eval_dataset=test_ds, task='test')
             test_result = output.metrics
 
             output_test_file = os.path.join(
-                training_args.output_dir, f"test_results_{test_dataset.args.task_name}.txt"
+                training_args.output_dir, f"test_results_{test_ds.args.task_name}.txt"
             )
             if trainer.is_world_process_zero():
                 with open(output_test_file, "w") as writer:
-                    logger.info("***** Test results {} *****".format(test_dataset.args.task_name))
+                    logger.info("***** Test results {} *****".format(test_ds.args.task_name))
                     for key, value in test_result.items():
                         logger.info("  %s = %s", key, value)
                         writer.write("%s = %s\n" % (key, value))
-                        final_result[test_dataset.args.task_name + '_test_' + key] = value
+                        final_result[test_ds.args.task_name + '_test_' + key] = value
 
                 if training_args.save_logit:
                     predictions = output.predictions
                     num_logits = predictions.shape[-1]
-                    logits = predictions.reshape([test_dataset.num_sample, -1, num_logits]).mean(axis=0)
-                    np.save(os.path.join(training_args.save_logit_dir, "{}-{}-{}.npy".format(test_dataset.task_name, training_args.model_id, training_args.array_id)), logits)
+                    logits = predictions.reshape([test_ds.num_sample, -1, num_logits]).mean(axis=0)
+                    np.save(
+                        os.path.join(
+                            training_args.save_logit_dir,
+                            "{}-{}-{}.npy".format(test_ds.task_name, training_args.model_id, training_args.array_id)
+                        ),
+                        logits
+                    )
 
             test_results.update(test_result)
-
 
     if trainer.is_world_process_zero():
         with FileLock('log.lock'):
@@ -1107,6 +1098,7 @@ def main():
     logger.info(training_args.output_dir)
 
     return eval_results
+
 
 if __name__ == "__main__":
     main()
